@@ -1,4 +1,12 @@
-"""ACE-Step v57 — 1.5 XL with proper handler architecture.
+"""ACE-Step v58 — 1.5 XL with proper handler architecture.
+
+v58 (Stephen 2026-06-16): pass full quality params to GenerationParams.
+     Previously passing only caption/duration/lyrics — model was running
+     on internal defaults causing bad audio. Now passes inference_steps,
+     guidance_scale, shift, infer_method, cfg_interval bounds, bpm,
+     keyscale, vocal_language, seed. Also activates DCW wavelet quality
+     filter (dcw_enabled=True, mode="double") — packages were installed
+     in v56 but never used. No Dockerfile changes — handler only.
 
 v57 (Stephen 2026-06-13): the 12-minute song test reached end-of-
 generation cleanly but failed when uploading the ~120MB WAV to
@@ -250,9 +258,44 @@ def handler(job):
         if lora_url:
             lora_temp = download_to_temp(lora_url, suffix=".safetensors")
 
-        params = GenerationParams(caption=caption, duration=duration)
-        if lyrics:
-            params.lyrics = lyrics
+        # ── per-request quality overrides (all have sane defaults) ────────
+        inference_steps = int(inp.get("inference_steps",      28))
+        guidance_scale  = float(inp.get("guidance_scale",     7.0))
+        shift           = float(inp.get("shift",              3.0))
+        infer_method    = inp.get("infer_method",             "ode")
+        cfg_start       = float(inp.get("cfg_interval_start", 0.0))
+        cfg_end         = float(inp.get("cfg_interval_end",   0.95))
+        bpm             = inp.get("bpm",                      None)
+        keyscale        = inp.get("keyscale",                 "")
+        vocal_language  = inp.get("vocal_language",           "en")
+        seed            = int(inp.get("seed",                 -1))
+
+        # DCW wavelet quality filter — packages installed since v56
+        dcw_enabled     = bool(inp.get("dcw_enabled",         True))
+        dcw_mode        = inp.get("dcw_mode",                 "double")
+        dcw_scaler      = float(inp.get("dcw_scaler",         0.05))
+        dcw_high_scaler = float(inp.get("dcw_high_scaler",    0.02))
+
+        params = GenerationParams(
+            caption=caption,
+            duration=duration,
+            lyrics=lyrics if lyrics else "",
+            task_type=inp.get("task_type", "text2music"),
+            vocal_language=vocal_language,
+            bpm=bpm,
+            keyscale=keyscale,
+            seed=seed,
+            inference_steps=inference_steps,
+            guidance_scale=guidance_scale,
+            shift=shift,
+            infer_method=infer_method,
+            cfg_interval_start=cfg_start,
+            cfg_interval_end=cfg_end,
+            dcw_enabled=dcw_enabled,
+            dcw_mode=dcw_mode,
+            dcw_scaler=dcw_scaler,
+            dcw_high_scaler=dcw_high_scaler,
+        )
         if lora_temp:
             params.lora_path = lora_temp
             params.lora_weight = float(inp.get("lora_weight", 1.0))
