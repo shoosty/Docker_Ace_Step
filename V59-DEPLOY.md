@@ -38,12 +38,25 @@ at the current 28-step / guidance-10 recipe. Quality impact of v60: zero
 
 ## Build + push
 
+v59 is a handler-only delta, so we build ON TOP of the proven-working
+v58 image instead of rebuilding from scratch. This sidesteps the fact
+that the main `Dockerfile` references `patch_config.py` which was
+never committed to this repo (built v58 from a machine that had it;
+file is now missing). To bake in a real Dockerfile-level change in
+the future, restore `patch_config.py` and use the full `./Dockerfile`
+build path.
+
 ```bash
 cd ~/Code/Docker_Ace_Step
 git checkout feature/v59-sweetspot-defaults
-docker build --platform linux/amd64 -t shoosty1/ace-step:v59 .
+docker build --platform linux/amd64 -f Dockerfile.v59 -t shoosty1/ace-step:v59 .
 docker push shoosty1/ace-step:v59
 ```
+
+Built + pushed 2026-06-18 — digest
+`sha256:28361e1909459d9693039b8a2cf031ce89b5cab006f4532d5ab4dac2a1a2e125`.
+Only 2 small layers (the new handler.py + the manifest); every other
+layer is shared with v58.
 
 ## RunPod endpoint update
 

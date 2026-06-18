@@ -1,0 +1,17 @@
+# v59 — handler-only delta on top of v58.
+#
+# The full Dockerfile references patch_config.py which was never
+# committed to this repo (built v58 from a machine that had it; it's
+# now missing). Since v59 changes nothing except handler.py, we don't
+# need to rebuild from scratch — we just layer the new handler over
+# the proven-working v58 image and re-tag.
+#
+# Resulting image is byte-identical to v58 except for /app/handler.py.
+# To bake in a future Dockerfile-level change, restore patch_config.py
+# and use the full ./Dockerfile build path.
+
+FROM shoosty1/ace-step:v58
+
+COPY handler.py /app/handler.py
+
+CMD ["python", "/app/handler.py"]
