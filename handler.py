@@ -1,4 +1,22 @@
-"""ACE-Step v59 — 1.5 XL handler with sweet-spot recipe baked in.
+"""ACE-Step v60 — 1.5 XL handler with sweet-spot recipe + mastering.
+
+v60 (Stephen 2026-06-18, later same day): adds opt-in two-pass loudnorm
+     mastering. Set master=true on the input to enable. The handler runs
+     ffmpeg's loudnorm filter (EBU R128 spec) before the MP3 transcode,
+     so audio_url comes back at -14 LUFS / -1 dBTP. When mastering is on
+     the MP3 bitrate bumps from 192 to 320 kbps so the codec doesn't
+     undo the polish. The raw unmastered WAV is preserved when
+     keep_wav=true — that's the artist's "I want to do my own mastering"
+     escape hatch. Idempotent in loudness (already-mastered input parses
+     as already at -14 and the second pass corrects ~nothing) but
+     quality-degrading on MP3->MP3 chains; the caller should track a
+     mastered_at flag and refuse to re-master the same audio_url.
+
+     Cost: ~9 seconds of CPU on a 4-minute song. GPU is idle during
+     the mastering pass, so it's effectively free time.
+
+     Still unfixed (deferred to v61 with image-side surgery): flash_attn
+     CUDA-12.8 ABI rebuild + nano-vllm triton pin.
 
 v59 (Stephen 2026-06-18): v58's DCW-on + guidance-7 defaults made
      the model sound terrible — confirmed across a 9-test E-series
@@ -183,6 +201,56 @@ def wav_to_mp3(wav_path: str, mp3_path: str, bitrate: str = "192k") -> None:
         check=True,
     )
 
+def master_audio(input_wav_path: str, output_wav_path: str) -> dict:
+    """v60 mastering pass — ffmpeg two-pass loudnorm.
+
+    Pass 1 measures the input loudness (EBU R128). Pass 2 normalizes
+    to streaming spec: I=-14 LUFS, LRA=11, true peak <= -1 dBTP.
+    `linear=true` keeps the gain transparent (constant-curve EQ-free
+    correction rather than the dynamic mode, which would re-compress).
+
+    Returns the measured input stats so the caller can log them and
+    decide whether to surface "already pretty hot" hints. Idempotent
+    in loudness terms — running on an already-mastered file changes
+    almost nothing because pass-1 reports the file is already at -14
+    LUFS and pass-2 has nothing to correct."""
+    import json as _json
+    # Pass 1 — measure.
+    proc = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-i", input_wav_path,
+         "-af", "loudnorm=I=-14:LRA=11:TP=-1:print_format=json",
+         "-f", "null", "-"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    # The JSON block is on stderr at the END of the run; find the
+    # last {...} that parses cleanly.
+    stderr = proc.stderr
+    last_brace = stderr.rfind("}")
+    start = stderr.rfind("{", 0, last_brace)
+    measured = _json.loads(stderr[start:last_brace + 1])
+    # Pass 2 — normalize using the measured stats.
+    filter_chain = (
+        "loudnorm=I=-14:LRA=11:TP=-1"
+        f":measured_I={measured['input_i']}"
+        f":measured_LRA={measured['input_lra']}"
+        f":measured_TP={measured['input_tp']}"
+        f":measured_thresh={measured['input_thresh']}"
+        f":offset={measured['target_offset']}"
+        ":linear=true"
+    )
+    subprocess.run(
+        ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+         "-i", input_wav_path,
+         "-af", filter_chain,
+         "-ar", "48000", "-ac", "2",
+         "-codec:a", "pcm_f32le",
+         output_wav_path],
+        check=True,
+    )
+    return measured
+
 def upload_to_supabase(local_path: str, storage_path: str, content_type: str) -> str:
     # v55 — reprint the env diagnostic right before the upload so the
     # diag block sits adjacent to the failure traceback (no scrolling
@@ -263,6 +331,16 @@ def handler(job):
             return {"error": f"format must be 'mp3' or 'wav', got '{fmt}'"}
         keep_wav   = bool(inp.get("keep_wav", False)) and fmt == "mp3"
         return_b64 = bool(inp.get("return_audio_b64", False))
+        # v60 — opt-in mastering pass. When true the handler runs
+        # ffmpeg loudnorm two-pass on the rendered WAV before any
+        # MP3 transcode + upload. Streaming spec: I=-14 LUFS, true
+        # peak <= -1 dBTP. When mastering is on, the MP3 bitrate
+        # bumps from 192 to 320 kbps so the mastered output isn't
+        # immediately hobbled by codec loss. Cost ~9s of CPU on a
+        # 4-min song. Idempotent in loudness terms (already-mastered
+        # input parses as already at -14 LUFS and pass-2 makes
+        # near-zero correction).
+        master     = bool(inp.get("master", False))
 
         ts       = int(time.time())
         short_id = uuid.uuid4().hex[:12]
@@ -348,15 +426,44 @@ def handler(job):
             if not wav_path:
                 return {"error": f"No audio file found. Result attrs: {dir(result)}"}
 
+            # v60 — opt-in mastering. Runs BEFORE the MP3 transcode so
+            # the mp3 carries the mastered audio (and at the bumped
+            # bitrate so we don't undo the polish with codec loss).
+            # The raw unmastered WAV is preserved at wav_path so it's
+            # still what gets uploaded if keep_wav is requested — the
+            # idea is that the artist always has the raw render available
+            # for their own offline mastering workflow.
+            mastered_stats = None
+            if master:
+                mastered_wav = os.path.join(save_dir, "mastered.wav")
+                print(f"[v60 master] running loudnorm two-pass on {wav_path}")
+                mastered_stats = master_audio(wav_path, mastered_wav)
+                print(
+                    f"[v60 master] measured I={mastered_stats.get('input_i')} "
+                    f"LRA={mastered_stats.get('input_lra')} "
+                    f"TP={mastered_stats.get('input_tp')} "
+                    f"offset={mastered_stats.get('target_offset')}"
+                )
+                # Replace the working wav for downstream transcode/upload.
+                # Raw render at wav_path stays untouched for keep_wav.
+                rendered_wav = wav_path  # remember for keep_wav branch
+                wav_for_primary = mastered_wav
+            else:
+                rendered_wav = wav_path
+                wav_for_primary = wav_path
+
             mp3_path = None
             if fmt == "mp3":
                 with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
                     mp3_path = f.name
-                wav_to_mp3(wav_path, mp3_path)
+                # 320 kbps when mastered so the polish survives the codec;
+                # 192 kbps when unmastered (the v58 default).
+                mp3_bitrate = "320k" if master else "192k"
+                wav_to_mp3(wav_for_primary, mp3_path, bitrate=mp3_bitrate)
                 primary_local = mp3_path
                 primary_ct = "audio/mpeg"
             else:
-                primary_local = wav_path
+                primary_local = wav_for_primary
                 primary_ct = "audio/wav"
 
             audio_url = upload_to_supabase(primary_local, storage_path, primary_ct)
@@ -368,9 +475,21 @@ def handler(job):
                 "duration": duration,
                 "task": "text2music",
             }
+            if master:
+                resp["mastered"] = True
+                resp["mastered_lufs_in"] = mastered_stats.get("input_i")
+                resp["mastered_lufs_out"] = -14.0
+                resp["mastered_tp_in"] = mastered_stats.get("input_tp")
+                resp["mp3_bitrate"] = "320k" if fmt == "mp3" else None
 
             if keep_wav:
-                wav_bytes = os.path.getsize(wav_path)
+                # v60 — keep_wav always saves the RAW unmastered render,
+                # never the mastered intermediate. The artist's "lossless
+                # source for my own mastering pipeline" expectation only
+                # holds if we preserve the unprocessed audio. The mastered
+                # MP3 (audio_url) covers the "I just want it to sound
+                # polished now" case.
+                wav_bytes = os.path.getsize(rendered_wav)
                 # v57 — Long songs blow past Supabase's per-object cap.
                 # The primary MP3 has already uploaded by the time we
                 # get here, so a 413 on the WAV shouldn't lose us the
@@ -391,7 +510,7 @@ def handler(job):
                 else:
                     try:
                         wav_url = upload_to_supabase(
-                            wav_path, storage_path_wav, "audio/wav"
+                            rendered_wav, storage_path_wav, "audio/wav"
                         )
                         resp["wav_url"] = wav_url
                         resp["wav_storage_path"] = storage_path_wav
