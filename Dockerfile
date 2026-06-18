@@ -1,6 +1,6 @@
 FROM --platform=linux/amd64 runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04
 
-# ACE-Step 1.5 XL — v57
+# ACE-Step 1.5 XL — v59
 # PyTorch 2.8, CUDA 12.8, official ACE-Step 1.5 requirements
 # v56: silences the worker-startup warnings + enables the upgrades
 #      Stephen flagged as "LoRA is the moat, speed is the margin":
@@ -14,6 +14,20 @@ FROM --platform=linux/amd64 runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-u
 #      and returns the song from the MP3 alone instead of failing
 #      the whole job. No deps changed, but bumping the tag so the
 #      endpoint cache flips.
+# v58: handler-only — pass full quality params + activate DCW. The
+#      DCW activation turned out to be the quality regression that
+#      sent us into a 9-test recipe search; see handler.py docstring.
+# v59: handler-only change — bake the sweet-spot recipe defaults so
+#      the studio stops needing to send overrides on every request.
+#      dcw_enabled=False, guidance_scale=10.0 (everything else
+#      unchanged). No image-side surgery.
+#      Known unsolved (deferred to v60 with image rebuild):
+#        + flash_attn import fails on RTX 5090 + CUDA 12.8 (symbol
+#          mismatch — needs a CUDA-12.8-compatible wheel rebuild).
+#          Currently falls back to PyTorch sdpa; works but slower.
+#        + nano-vllm fails on the same hardware due to triton's
+#          `triton_key` having been removed in a later version.
+#          Pin a compatible triton wheel to restore the LM speedup.
 
 RUN apt-get update && apt-get install -y git curl ffmpeg && apt-get clean
 

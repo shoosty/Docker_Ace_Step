@@ -1,4 +1,24 @@
-"""ACE-Step v58 — 1.5 XL with proper handler architecture.
+"""ACE-Step v59 — 1.5 XL handler with sweet-spot recipe baked in.
+
+v59 (Stephen 2026-06-18): v58's DCW-on + guidance-7 defaults made
+     the model sound terrible — confirmed across a 9-test E-series
+     listening matrix (E1=DCW-off was clean; E3=DCW-double was the
+     "terrible" baseline; E7=guidance-10 was the loved single-knob
+     bump). Two interactions worth knowing: (a) combining 50 steps
+     with guidance 10 (E10) broke it — knobs don't compound, pick
+     one bump or the other, and (b) raising guidance past 10 (E12)
+     muffled the vocal. v59 flips just the two defaults that the
+     E-series proved correct: dcw_enabled=False, guidance_scale=10.0.
+     Steps stays at 28; ODE sampler; shift 3.0; cfg window 0.0->0.95.
+     Per-request callers can still override anything — the studio
+     stopped sending overrides as of the same date.
+
+     Known unsolved (NOT addressed in v59): flash_attn fails to
+     import on RTX 5090 + CUDA 12.8 (symbol mismatch); nano-vllm
+     fails on the same hardware due to a triton ABI break
+     (triton_key was removed). Both fall back to PyTorch — works
+     but slower + more CPU-bound. Real fix is a CUDA-12.8 flash_attn
+     rebuild + triton pin in a future v60.
 
 v58 (Stephen 2026-06-16): pass full quality params to GenerationParams.
      Previously passing only caption/duration/lyrics — model was running
@@ -7,6 +27,7 @@ v58 (Stephen 2026-06-16): pass full quality params to GenerationParams.
      keyscale, vocal_language, seed. Also activates DCW wavelet quality
      filter (dcw_enabled=True, mode="double") — packages were installed
      in v56 but never used. No Dockerfile changes — handler only.
+     (Quality regression — see v59.)
 
 v57 (Stephen 2026-06-13): the 12-minute song test reached end-of-
 generation cleanly but failed when uploading the ~120MB WAV to
@@ -258,9 +279,14 @@ def handler(job):
         if lora_url:
             lora_temp = download_to_temp(lora_url, suffix=".safetensors")
 
-        # ── per-request quality overrides (all have sane defaults) ────────
+        # ── per-request quality overrides ────────────────────────────────
+        # Defaults are the v59 sweet-spot recipe (Stephen 2026-06-18) —
+        # see module docstring for the E1-E12 listening series that
+        # produced them. Callers can override any single value, BUT do
+        # not combine inference_steps=50 with guidance_scale=10 — the
+        # E10 test proved the two best individual knobs don't compound.
         inference_steps = int(inp.get("inference_steps",      28))
-        guidance_scale  = float(inp.get("guidance_scale",     7.0))
+        guidance_scale  = float(inp.get("guidance_scale",     10.0))
         shift           = float(inp.get("shift",              3.0))
         infer_method    = inp.get("infer_method",             "ode")
         cfg_start       = float(inp.get("cfg_interval_start", 0.0))
@@ -270,8 +296,16 @@ def handler(job):
         vocal_language  = inp.get("vocal_language",           "en")
         seed            = int(inp.get("seed",                 -1))
 
-        # DCW wavelet quality filter — packages installed since v56
-        dcw_enabled     = bool(inp.get("dcw_enabled",         True))
+        # DCW wavelet quality filter — packages installed since v56.
+        # v59 flipped the default to OFF after the E3 listening test
+        # showed dcw_mode="double" produces "terrible" scrambled audio.
+        # Valid dcw_mode values are ('low', 'high', 'double', 'pix');
+        # 'single' is NOT valid (would raise from DCWCorrector). When
+        # enabled, the DCW correction lives at the wavelet decompose
+        # step and adds detail at higher frequencies — useful for
+        # specific styles, but the default-off recipe is what users
+        # actually want.
+        dcw_enabled     = bool(inp.get("dcw_enabled",         False))
         dcw_mode        = inp.get("dcw_mode",                 "double")
         dcw_scaler      = float(inp.get("dcw_scaler",         0.05))
         dcw_high_scaler = float(inp.get("dcw_high_scaler",    0.02))
