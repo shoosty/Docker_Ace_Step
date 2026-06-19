@@ -1,0 +1,18 @@
+# v61 — handler-only delta on top of v60.
+#
+# Same pattern as Dockerfile.v59 and Dockerfile.v60: nothing image-side
+# changes (no new deps), the only diff is handler.py with the v61
+# per-stage Supabase telemetry calls.
+#
+# What v61 adds: every stage transition (handler_entry, generate_music,
+# master, wav_to_mp3, upload_primary, upload_wav, complete, handler_error)
+# inserts a row into public.ace_worker_telemetry on Supabase. When a
+# worker wedges and RunPod's worker logs vanish, that table is the
+# post-mortem source. Stephen 2026-06-19: "the worker logs disappear.
+# nothing to see."
+
+FROM shoosty1/ace-step:v60
+
+COPY handler.py /app/handler.py
+
+CMD ["python", "/app/handler.py"]

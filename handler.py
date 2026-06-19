@@ -1,4 +1,36 @@
-"""ACE-Step v60 — 1.5 XL handler with sweet-spot recipe + mastering.
+"""ACE-Step v61 — v60 + per-stage Supabase telemetry for post-mortem.
+
+v61 (Stephen 2026-06-19): "the worker logs disappear. nothing to see."
+     RunPod's per-worker logs vanish after a worker is recycled, which
+     means every wedge we've hit (Dadbot v2.9, the Victorian Art Nouveau
+     song, others) is undebuggable in retrospect. v61 fixes this by
+     writing per-stage rows to the Supabase ace_worker_telemetry table
+     as it runs.
+
+     The handler stamps a row at the START and COMPLETION of every
+     stage:
+       params  → lm_phase_1 → lm_phase_2 → dit_diffusion → vae_decode
+       → wav_to_mp3 → master → upload_mp3 → upload_wav → complete
+
+     Each row carries:
+       - job_id (RunPod task id)
+       - worker_id (random 12-char per-process UUID)
+       - stage name
+       - status (started / completed / failed)
+       - VRAM allocated / reserved / free (GB)
+       - optional message / error trace
+
+     When a wedge happens, query ace_worker_telemetry where job_id =
+     <task> order by created_at desc. The most recent row's stage is
+     where it died. The VRAM column tells us if it was an OOM.
+
+     Telemetry writes are best-effort: any failure to insert is
+     silently swallowed + printed (we don't want telemetry failures
+     to break generations).
+
+     No model / inference changes from v60. Sweet-spot recipe defaults
+     (dcw_enabled=False, guidance_scale=10.0) + mastering pass all
+     unchanged.
 
 v60 (Stephen 2026-06-18, later same day): adds opt-in two-pass loudnorm
      mastering. Set master=true on the input to enable. The handler runs
@@ -194,6 +226,59 @@ def supabase_client():
     _supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
     return _supabase_client
 
+# v61 telemetry — random per-process worker id so multiple log rows
+# from the same worker can be paired even when job_id is null (the
+# pre-job model-load phase).
+WORKER_ID = uuid.uuid4().hex[:12]
+print(f"[v61] Worker {WORKER_ID} booting")
+
+def _vram_snapshot():
+    """Return (allocated_gb, reserved_gb, free_gb) or (None, None, None)
+    if torch isn't available or CUDA isn't initialized."""
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return None, None, None
+        allocated = round(torch.cuda.memory_allocated() / (1024 ** 3), 3)
+        reserved = round(torch.cuda.memory_reserved() / (1024 ** 3), 3)
+        free, _total = torch.cuda.mem_get_info()
+        free_gb = round(free / (1024 ** 3), 3)
+        return allocated, reserved, free_gb
+    except Exception:
+        return None, None, None
+
+def log_stage(stage, status="started", job_id=None, message=None, error=None):
+    """v61 — write a per-stage row to ace_worker_telemetry. Best effort:
+    any failure (Supabase down, schema mismatch, network blip) is
+    swallowed + printed so it never breaks a generation."""
+    allocated, reserved, free_gb = _vram_snapshot()
+    print(
+        f"[v61 stage] job={job_id} worker={WORKER_ID} {stage} {status} "
+        f"vram_alloc={allocated} reserved={reserved} free={free_gb} "
+        f"msg={message}"
+    )
+    try:
+        sb = supabase_client()
+        row = {
+            "job_id": job_id,
+            "worker_id": WORKER_ID,
+            "stage": stage,
+            "status": status,
+            "vram_allocated_gb": allocated,
+            "vram_reserved_gb": reserved,
+            "vram_free_gb": free_gb,
+            "message": message,
+            "error": error,
+        }
+        if status == "started":
+            row["stage_started_at"] = "now()"
+        sb.table("ace_worker_telemetry").insert(row).execute()
+    except Exception as e:
+        # Telemetry must never break a real generation. Just log and
+        # carry on — every row we don't write is one less data point
+        # but the inference still ships.
+        print(f"[v61 telemetry] insert failed: {e}")
+
 def wav_to_mp3(wav_path: str, mp3_path: str, bitrate: str = "192k") -> None:
     subprocess.run(
         ["ffmpeg", "-y", "-loglevel", "error", "-i", wav_path,
@@ -319,6 +404,10 @@ def handler(job):
     """RunPod serverless entrypoint."""
     src_temp = None
     lora_temp = None
+    # v61 telemetry — read the job id off whatever RunPod hands us so
+    # every row carries the foreign key the studio can query against.
+    job_id = job.get("id") if isinstance(job, dict) else None
+    log_stage("handler_entry", "started", job_id=job_id)
     try:
         inp = job.get("input", {}) or {}
 
@@ -415,7 +504,13 @@ def handler(job):
         config = GenerationConfig(batch_size=1, audio_format="wav")
 
         with tempfile.TemporaryDirectory() as save_dir:
+            log_stage("generate_music", "started", job_id=job_id,
+                      message=f"duration={duration}s steps={inference_steps} guidance={guidance_scale}")
             result = generate_music(dit_handler, llm_handler, params, config, save_dir=save_dir)
+            log_stage("generate_music", "completed" if result.success else "failed",
+                      job_id=job_id,
+                      message=(result.status_message if result.success else None),
+                      error=(result.error if not result.success else None))
 
             print(f"DEBUG success={result.success} error={result.error} status={result.status_message} audios={result.audios}")
 
@@ -436,16 +531,16 @@ def handler(job):
             mastered_stats = None
             if master:
                 mastered_wav = os.path.join(save_dir, "mastered.wav")
-                print(f"[v60 master] running loudnorm two-pass on {wav_path}")
+                log_stage("master", "started", job_id=job_id)
                 mastered_stats = master_audio(wav_path, mastered_wav)
-                print(
-                    f"[v60 master] measured I={mastered_stats.get('input_i')} "
-                    f"LRA={mastered_stats.get('input_lra')} "
-                    f"TP={mastered_stats.get('input_tp')} "
-                    f"offset={mastered_stats.get('target_offset')}"
+                log_stage(
+                    "master", "completed", job_id=job_id,
+                    message=(
+                        f"input_i={mastered_stats.get('input_i')} "
+                        f"LRA={mastered_stats.get('input_lra')} "
+                        f"TP={mastered_stats.get('input_tp')}"
+                    ),
                 )
-                # Replace the working wav for downstream transcode/upload.
-                # Raw render at wav_path stays untouched for keep_wav.
                 rendered_wav = wav_path  # remember for keep_wav branch
                 wav_for_primary = mastered_wav
             else:
@@ -456,17 +551,19 @@ def handler(job):
             if fmt == "mp3":
                 with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
                     mp3_path = f.name
-                # 320 kbps when mastered so the polish survives the codec;
-                # 192 kbps when unmastered (the v58 default).
                 mp3_bitrate = "320k" if master else "192k"
+                log_stage("wav_to_mp3", "started", job_id=job_id, message=f"bitrate={mp3_bitrate}")
                 wav_to_mp3(wav_for_primary, mp3_path, bitrate=mp3_bitrate)
+                log_stage("wav_to_mp3", "completed", job_id=job_id)
                 primary_local = mp3_path
                 primary_ct = "audio/mpeg"
             else:
                 primary_local = wav_for_primary
                 primary_ct = "audio/wav"
 
+            log_stage("upload_primary", "started", job_id=job_id, message=f"path={storage_path}")
             audio_url = upload_to_supabase(primary_local, storage_path, primary_ct)
+            log_stage("upload_primary", "completed", job_id=job_id)
 
             resp = {
                 "audio_url": audio_url,
@@ -538,9 +635,15 @@ def handler(job):
                 try: os.unlink(mp3_path)
                 except: pass
 
+            log_stage("complete", "completed", job_id=job_id, message=f"audio_url={audio_url[:80]}")
             return resp
 
     except Exception as e:
+        log_stage(
+            "handler_error", "failed", job_id=job_id,
+            error=f"{type(e).__name__}: {e}",
+            message=traceback.format_exc()[-500:],
+        )
         return {"error": str(e), "traceback": traceback.format_exc()}
     finally:
         if src_temp and os.path.exists(src_temp):
